@@ -8,7 +8,7 @@ for type-safe multimodal output routing and tensor merging.
 from __future__ import annotations
 
 import re
-from enum import Enum, Flag, StrEnum, auto
+from enum import Enum, Flag, auto
 from typing import Literal, TypeAlias
 
 FinalOutputModalityType: TypeAlias = Literal["text", "image", "audio", "video"]
@@ -26,7 +26,7 @@ _MODALITY_ALIASES: dict[str, str] = {
 }
 
 
-class OutputModalityNames(StrEnum):
+class OutputModalityNames(str, Enum):
     """Keys for output modalities.
 
     TODO: (Alex) Integrate this with the big-flag enum below + throughout the code
