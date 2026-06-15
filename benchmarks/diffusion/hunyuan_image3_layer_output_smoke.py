@@ -1,14 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Smoke test HunyuanImage-3.0 batched-prompt output count with few DiT layers.
+"""Smoke test HunyuanImage-3.0 batched-prompt output count.
 
-This script is intentionally a correctness smoke, not a quality benchmark. It
-loads the real HunyuanImage-3.0 pipeline, truncates the DiT stack to a small
-number of layers on every diffusion worker, then checks that one batched
-diffusion request with N prompts returns N images.
+By default this is a lightweight mock smoke: it does not download or load model
+weights. It mocks the Hunyuan ``_generate()`` return object with N PIL images and
+checks that the wrapper-style output aggregation preserves all N images.
+
+For a heavier integration smoke, pass ``--no-mock-generate``. That path loads
+the real HunyuanImage-3.0 pipeline, truncates the DiT stack to a small number of
+layers on every diffusion worker, then checks that one batched diffusion request
+with N prompts returns N images.
 
 Example:
     python benchmarks/diffusion/hunyuan_image3_layer_output_smoke.py \
+        --image-sizes 512x512,512x768 --output-dir /tmp/hunyuan_mock_smoke
+
+    python benchmarks/diffusion/hunyuan_image3_layer_output_smoke.py \
+        --no-mock-generate \
         --model tencent/HunyuanImage-3.0-Instruct \
         --image-sizes 512x512,512x768 \
         --num-layers 1 --steps 1 --tensor-parallel-size 2 \
@@ -22,16 +30,11 @@ import asyncio
 import json
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import torch
-from torch import nn
-
-from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
-from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
-from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from PIL import Image
 
 
 class HunyuanLayerSmokeWorkerExtension:
@@ -43,6 +46,8 @@ class HunyuanLayerSmokeWorkerExtension:
     """
 
     def truncate_hunyuan_layers(self, num_layers: int) -> dict[str, Any]:
+        from torch import nn
+
         pipeline = self.model_runner.pipeline
         if pipeline is None:
             raise RuntimeError("Pipeline is not loaded.")
@@ -74,6 +79,56 @@ class HunyuanLayerSmokeWorkerExtension:
             "pipeline": type(pipeline).__name__,
             "model": type(model).__name__,
         }
+
+
+@dataclass
+class MockHunyuanGenerateOutput:
+    samples: list[Image.Image]
+
+    def __getitem__(self, index: int) -> Any:
+        if index == 0:
+            return self.samples
+        raise IndexError(index)
+
+
+@dataclass
+class MockRequestOutput:
+    request_id: str
+    images: list[Image.Image]
+    latency_s: float
+
+
+@dataclass
+class MockDiffusionOutput:
+    output: Any
+
+
+def make_mock_images(sizes: list[tuple[int, int]]) -> list[Image.Image]:
+    images: list[Image.Image] = []
+    for idx, (height, width) in enumerate(sizes):
+        color = ((53 * (idx + 1)) % 255, (97 * (idx + 3)) % 255, (149 * (idx + 5)) % 255)
+        images.append(Image.new("RGB", (width, height), color=color))
+    return images
+
+
+def mock_hunyuan_generate(sizes: list[tuple[int, int]]) -> MockHunyuanGenerateOutput:
+    return MockHunyuanGenerateOutput(samples=make_mock_images(sizes))
+
+
+def wrap_mock_generate_output(outputs: MockHunyuanGenerateOutput) -> MockDiffusionOutput:
+    # Mirrors HunyuanImage3Pipeline.forward(): preserve the complete
+    # diffusers-style ``samples`` field instead of treating the output as a
+    # single tuple item.
+    output_samples = outputs.samples if hasattr(outputs, "samples") else outputs[0]
+    return MockDiffusionOutput(output=output_samples)
+
+
+def mock_engine_outputs(
+    diffusion_output: MockDiffusionOutput, request_id: str, latency_s: float
+) -> list[MockRequestOutput]:
+    output_data = diffusion_output.output
+    outputs = output_data if isinstance(output_data, list) else ([output_data] if output_data is not None else [])
+    return [MockRequestOutput(request_id=request_id, images=outputs, latency_s=latency_s)]
 
 
 def parse_image_sizes(raw: str) -> list[tuple[int, int]]:
@@ -109,7 +164,7 @@ def parse_prompts(raw: str | None, count: int) -> list[str]:
     return prompts
 
 
-def build_prompt_dicts(prompts: list[str], sizes: list[tuple[int, int]]) -> list[OmniTextPrompt]:
+def build_prompt_dicts(prompts: list[str], sizes: list[tuple[int, int]]) -> list[dict[str, Any]]:
     return [
         {
             "prompt": prompt,
@@ -121,7 +176,11 @@ def build_prompt_dicts(prompts: list[str], sizes: list[tuple[int, int]]) -> list
     ]
 
 
-def make_config(args: argparse.Namespace) -> OmniDiffusionConfig:
+def make_config(args: argparse.Namespace) -> Any:
+    import torch
+
+    from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+
     parallel_config = DiffusionParallelConfig(
         tensor_parallel_size=args.tensor_parallel_size,
         enable_expert_parallel=args.enable_expert_parallel,
@@ -152,7 +211,9 @@ def make_config(args: argparse.Namespace) -> OmniDiffusionConfig:
     return config
 
 
-def make_sampling_params(args: argparse.Namespace, first_size: tuple[int, int]) -> OmniDiffusionSamplingParams:
+def make_sampling_params(args: argparse.Namespace, first_size: tuple[int, int]) -> Any:
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
     height, width = first_size
     return OmniDiffusionSamplingParams(
         height=height,
@@ -193,7 +254,46 @@ def save_outputs(outputs: list[Any], output_dir: str | None) -> None:
             image_idx += 1
 
 
+async def run_mock_smoke(args: argparse.Namespace) -> dict[str, Any]:
+    sizes = parse_image_sizes(args.image_sizes)
+    prompts = parse_prompts(args.prompts, len(sizes))
+    _ = build_prompt_dicts(prompts, sizes)
+
+    start = time.perf_counter()
+    generate_output = mock_hunyuan_generate(sizes)
+    diffusion_output = wrap_mock_generate_output(generate_output)
+    outputs = mock_engine_outputs(
+        diffusion_output,
+        request_id=f"hunyuan-mock-smoke-{uuid.uuid4()}",
+        latency_s=time.perf_counter() - start,
+    )
+    elapsed = time.perf_counter() - start
+    actual_images = count_images(outputs)
+    save_outputs(outputs, args.output_dir)
+
+    result = {
+        "mode": "mock_generate",
+        "status": "passed" if actual_images == len(sizes) else "failed",
+        "expected_images": len(sizes),
+        "actual_images": actual_images,
+        "num_request_outputs": len(outputs),
+        "elapsed_s": elapsed,
+        "image_sizes": sizes,
+        "note": "No model weights were downloaded or loaded; _generate() output was mocked.",
+    }
+    print(json.dumps(result, indent=2, default=str))
+    if actual_images != len(sizes):
+        raise AssertionError(f"Expected {len(sizes)} images, got {actual_images}.")
+    return result
+
+
 async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
+    if args.mock_generate:
+        return await run_mock_smoke(args)
+
+    from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+
     sizes = parse_image_sizes(args.image_sizes)
     prompts = parse_prompts(args.prompts, len(sizes))
     prompt_dicts = build_prompt_dicts(prompts, sizes)
@@ -249,6 +349,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--steps must be >= 1.")
     if args.num_layers < 1:
         raise ValueError("--num-layers must be >= 1.")
+    if not args.mock_generate and not args.model:
+        raise ValueError("--model is required when using --no-mock-generate.")
     if args.cfg_parallel_size != 1:
         raise ValueError("This smoke test requires --cfg-parallel-size 1.")
     if args.ulysses_degree != 1 or args.ring_degree != 1:
@@ -257,7 +359,7 @@ def validate_args(args: argparse.Namespace) -> None:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", required=True)
+    parser.add_argument("--model", default=None)
     parser.add_argument("--model-class-name", default="HunyuanImage3Pipeline")
     parser.add_argument("--image-sizes", default="512x512,512x768")
     parser.add_argument("--prompts", default=None, help="Prompts separated by '||'. Must match --image-sizes count.")
@@ -285,6 +387,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-type", default="pil", choices=["pil", "latent"])
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--rpc-timeout", type=float, default=120.0)
+    parser.add_argument("--mock-generate", action=argparse.BooleanOptionalAction, default=True)
     return parser
 
 
